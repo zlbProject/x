@@ -2,6 +2,7 @@ package udp
 
 import (
 	"net"
+	"sync"
 
 	"github.com/go-gost/core/limiter"
 	"github.com/go-gost/core/listener"
@@ -9,7 +10,7 @@ import (
 	md "github.com/go-gost/core/metadata"
 	admission "github.com/go-gost/x/admission/wrapper"
 	xnet "github.com/go-gost/x/internal/net"
-	"github.com/go-gost/x/internal/net/udp"
+	gudp "github.com/go-gost/x/internal/net/udp" // 使用别名，避免与包名冲突
 	traffic_limiter "github.com/go-gost/x/limiter/traffic"
 	limiter_wrapper "github.com/go-gost/x/limiter/traffic/wrapper"
 	metrics "github.com/go-gost/x/metrics/wrapper"
@@ -22,10 +23,13 @@ func init() {
 }
 
 type udpListener struct {
-	ln      net.Listener
-	logger  logger.Logger
-	md      metadata
-	options listener.Options
+	ln         net.Listener
+	packetConn net.PacketConn // 保存 PacketConn 的引用
+	logger     logger.Logger
+	md         metadata
+	options    listener.Options
+	closed     bool
+	mu         sync.Mutex
 }
 
 func NewListener(opts ...listener.Option) listener.Listener {
@@ -70,7 +74,9 @@ func (l *udpListener) Init(md md.Metadata) (err error) {
 		limiter.NetworkOption(conn.LocalAddr().Network()),
 	)
 
-	l.ln = udp.NewListener(conn, &udp.ListenConfig{
+	l.packetConn = conn // 保存 PacketConn
+
+	l.ln = gudp.NewListener(conn, &gudp.ListenConfig{ // 使用别名
 		Backlog:        l.md.backlog,
 		ReadQueueSize:  l.md.readQueueSize,
 		ReadBufferSize: l.md.readBufferSize,
@@ -90,5 +96,27 @@ func (l *udpListener) Addr() net.Addr {
 }
 
 func (l *udpListener) Close() error {
-	return l.ln.Close()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.closed {
+		return nil
+	}
+	l.closed = true
+
+	err := l.ln.Close()
+	if err != nil {
+		l.logger.Warnf("close listener error: %v", err)
+		//return err  //Don't return error, continue closing packetconn
+	}
+
+	// 关闭 PacketConn
+	if l.packetConn != nil {
+		err = l.packetConn.Close()
+		if err != nil {
+			l.logger.Warnf("close packetconn error: %v", err)
+		}
+	}
+
+	return err
 }
